@@ -7,6 +7,9 @@ SQLite層（スキーマ・CRUD・次回実行日時の計算）
 - 日時は DB には UTC の ISO 文字列で保存する（文字列比較で大小が正しく判定できる）。
   ユーザー向けの時刻（実行時刻・once_at）は「設定のタイムゾーン」(既定 Asia/Tokyo) で扱う。
 - Webhook URL は秘密情報。画面表示には必ず mask_webhook() を通すこと。
+- 送信先（Webhook）は destinations テーブルに名前つきで登録し、予約・誕生日は destination_id で参照する。
+  読み出し用のクエリが webhook_url（送信先の URL）と destination_name を付けて返すので、
+  sender.py は row["webhook_url"] を使うだけでよい。
 """
 
 from __future__ import annotations
@@ -80,10 +83,18 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS destinations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    webhook_url TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS schedules (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT NOT NULL,
-    webhook_url   TEXT NOT NULL,
+    webhook_url   TEXT NOT NULL DEFAULT '',        -- 旧形式。いまは使わない（移行後は空）
+    destination_id INTEGER,                        -- destinations.id
     content       TEXT NOT NULL,
     kind          TEXT NOT NULL CHECK (kind IN ('once','daily','weekly','monthly','yearly')),
     run_time      TEXT NOT NULL DEFAULT '09:00',   -- HH:MM（once では未使用）
@@ -105,7 +116,8 @@ CREATE TABLE IF NOT EXISTS birthdays (
     name          TEXT NOT NULL,
     month         INTEGER NOT NULL CHECK (month BETWEEN 1 AND 12),
     day           INTEGER NOT NULL CHECK (day BETWEEN 1 AND 31),
-    webhook_url   TEXT NOT NULL,
+    webhook_url   TEXT NOT NULL DEFAULT '',        -- 旧形式。いまは使わない（移行後は空）
+    destination_id INTEGER,                        -- destinations.id
     template      TEXT NOT NULL DEFAULT '{name}さん、お誕生日おめでとうございます！',
     discord_id    TEXT,                            -- 任意。入れると <@ID> でメンションできる
     missed_policy TEXT NOT NULL DEFAULT 'late_send'
@@ -129,10 +141,55 @@ CREATE INDEX IF NOT EXISTS idx_logs_created ON logs(created_at DESC);
 """
 
 
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧形式（予約・誕生日が Webhook URL を直接持つ）のDBを、送信先テーブル方式に移す。
+
+    何度呼んでも安全。URL ごとに送信先を1つ作り、予約・誕生日をそれに結びつける。
+    """
+    for table in ("schedules", "birthdays"):
+        if "destination_id" not in _column_names(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN destination_id INTEGER")
+
+    urls = [
+        r[0]
+        for r in conn.execute(
+            "SELECT webhook_url FROM schedules WHERE destination_id IS NULL AND webhook_url != '' "
+            "UNION SELECT webhook_url FROM birthdays WHERE destination_id IS NULL AND webhook_url != '' "
+            "ORDER BY 1"
+        )
+    ]
+    for url in urls:
+        row = conn.execute("SELECT id FROM destinations WHERE webhook_url = ? ORDER BY id", (url,)).fetchone()
+        if row is not None:
+            dest_id = row["id"]
+        else:
+            base = f"既存の送信先（{mask_webhook(url)}）"
+            name, i = base, 2
+            while conn.execute("SELECT 1 FROM destinations WHERE name = ?", (name,)).fetchone():
+                name, i = f"{base}{i}", i + 1
+            dest_id = conn.execute(
+                "INSERT INTO destinations (name, webhook_url, created_at) VALUES (?, ?, ?)",
+                (name, url, to_utc_str(utc_now())),
+            ).lastrowid
+        for table in ("schedules", "birthdays"):
+            conn.execute(
+                f"UPDATE {table} SET destination_id = ?, webhook_url = '' "
+                "WHERE webhook_url = ? AND destination_id IS NULL",
+                (dest_id, url),
+            )
+
+
 def init_db(path: Optional[Path] = None) -> None:
-    """テーブルを作成し、未設定の設定値に既定値を入れる（何度呼んでも安全）。"""
+    """テーブルを作成し、旧形式のDBなら移行して、未設定の設定値に既定値を入れる（何度呼んでも安全）。"""
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        # sender と管理画面が同時に起動しても、移行が二重に走らないよう、ここで順番待ちにする
+        conn.execute("BEGIN IMMEDIATE")
+        _migrate(conn)
         for key, value in DEFAULT_SETTINGS.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value)
@@ -301,6 +358,94 @@ def next_occurrence(
 
 
 # ----------------------------------------------------------------------
+# 送信先（destinations）  ※名前つきで複数登録し、予約・誕生日から選ぶ
+# ----------------------------------------------------------------------
+
+def _clean_destination_id(value: Any) -> int:
+    if value is None or value == "":
+        raise ValueError("送信先を選んでください")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError("送信先が正しくありません") from e
+
+
+def _check_destination_exists(conn: sqlite3.Connection, destination_id: int) -> None:
+    if conn.execute("SELECT 1 FROM destinations WHERE id = ?", (destination_id,)).fetchone() is None:
+        raise ValueError("選んだ送信先が見つかりません（削除された可能性があります）")
+
+
+def _clean_destination_name(name: Any) -> str:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("送信先の名前が空です")
+    if len(name) > 40:
+        raise ValueError("送信先の名前は 40 文字までです")
+    return name
+
+
+def add_destination(
+    conn: sqlite3.Connection, *, name: str, webhook_url: str, now: Optional[datetime] = None
+) -> int:
+    name = _clean_destination_name(name)
+    url = validate_webhook(webhook_url)
+    try:
+        cur = conn.execute(
+            "INSERT INTO destinations (name, webhook_url, created_at) VALUES (?, ?, ?)",
+            (name, url, to_utc_str(now or utc_now())),
+        )
+    except sqlite3.IntegrityError as e:
+        raise ValueError("同じ名前の送信先がすでにあります") from e
+    return int(cur.lastrowid)
+
+
+def get_destination(conn: sqlite3.Connection, destination_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM destinations WHERE id = ?", (destination_id,)).fetchone()
+
+
+def list_destinations(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """送信先の一覧。schedule_count / birthday_count は、その送信先を使っている件数。"""
+    return conn.execute(
+        "SELECT d.*, "
+        "(SELECT COUNT(*) FROM schedules s WHERE s.destination_id = d.id) AS schedule_count, "
+        "(SELECT COUNT(*) FROM birthdays b WHERE b.destination_id = d.id) AS birthday_count "
+        "FROM destinations d ORDER BY d.id"
+    ).fetchall()
+
+
+def update_destination(
+    conn: sqlite3.Connection, destination_id: int, *,
+    name: Optional[str] = None, webhook_url: Optional[str] = None,
+) -> None:
+    """名前・URL を変更する。webhook_url が None か空なら URL は今のまま。"""
+    row = get_destination(conn, destination_id)
+    if row is None:
+        raise ValueError(f"送信先 #{destination_id} は存在しません")
+    new_name = _clean_destination_name(row["name"] if name is None else name)
+    new_url = validate_webhook(webhook_url) if (webhook_url or "").strip() else row["webhook_url"]
+    try:
+        conn.execute(
+            "UPDATE destinations SET name = ?, webhook_url = ? WHERE id = ?",
+            (new_name, new_url, destination_id),
+        )
+    except sqlite3.IntegrityError as e:
+        raise ValueError("同じ名前の送信先がすでにあります") from e
+
+
+def delete_destination(conn: sqlite3.Connection, destination_id: int) -> None:
+    """使われている送信先は削除できない（予約・誕生日の送信先が消えてしまうため）。"""
+    row = next((r for r in list_destinations(conn) if r["id"] == destination_id), None)
+    if row is None:
+        return
+    if row["schedule_count"] or row["birthday_count"]:
+        raise ValueError(
+            f"この送信先は予約 {row['schedule_count']} 件・誕生日 {row['birthday_count']} 件で使われているため、"
+            "削除できません。先に別の送信先へ変えてください"
+        )
+    conn.execute("DELETE FROM destinations WHERE id = ?", (destination_id,))
+
+
+# ----------------------------------------------------------------------
 # 予約（schedules）
 # ----------------------------------------------------------------------
 
@@ -316,7 +461,7 @@ def _validate_schedule(f: dict[str, Any], tz: ZoneInfo, *, now: datetime) -> dic
         raise ValueError("本文が空です")
     if len(out["content"]) > 2000:
         raise ValueError("本文が長すぎます（Discord の上限は 2000 文字です）")
-    out["webhook_url"] = validate_webhook(f.get("webhook_url", ""))
+    out["destination_id"] = _clean_destination_id(f.get("destination_id"))
 
     kind = f.get("kind")
     if kind not in KINDS:
@@ -372,30 +517,40 @@ def _validate_schedule(f: dict[str, Any], tz: ZoneInfo, *, now: datetime) -> dic
 
 
 _SCHEDULE_COLS = (
-    "name", "webhook_url", "content", "kind", "run_time", "once_at",
+    "name", "destination_id", "content", "kind", "run_time", "once_at",
     "weekday", "month_day", "month", "missed_policy",
+)
+
+# webhook_url は「送信先テーブルのURL」を返す（sender.py はこれをそのまま使う）
+_SCHEDULE_SELECT = (
+    "SELECT s.id, s.name, s.destination_id, d.name AS destination_name, "
+    "COALESCE(d.webhook_url, s.webhook_url) AS webhook_url, "
+    "s.content, s.kind, s.run_time, s.once_at, s.weekday, s.month_day, s.month, "
+    "s.missed_policy, s.enabled, s.next_run, s.last_run, s.created_at "
+    "FROM schedules s LEFT JOIN destinations d ON d.id = s.destination_id"
 )
 
 
 def add_schedule(conn: sqlite3.Connection, *, now: Optional[datetime] = None, **fields: Any) -> int:
     now = now or utc_now()
     v = _validate_schedule(fields, get_tz(conn), now=now)
+    _check_destination_exists(conn, v["destination_id"])
     nxt = v["_next"]
     cur = conn.execute(
-        f"INSERT INTO schedules ({', '.join(_SCHEDULE_COLS)}, enabled, next_run, created_at) "
-        f"VALUES ({', '.join('?' for _ in _SCHEDULE_COLS)}, 1, ?, ?)",
+        f"INSERT INTO schedules ({', '.join(_SCHEDULE_COLS)}, webhook_url, enabled, next_run, created_at) "
+        f"VALUES ({', '.join('?' for _ in _SCHEDULE_COLS)}, '', 1, ?, ?)",
         [v[c] for c in _SCHEDULE_COLS] + [to_utc_str(nxt) if nxt else None, to_utc_str(now)],
     )
     return int(cur.lastrowid)
 
 
 def get_schedule(conn: sqlite3.Connection, schedule_id: int) -> Optional[sqlite3.Row]:
-    return conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    return conn.execute(_SCHEDULE_SELECT + " WHERE s.id = ?", (schedule_id,)).fetchone()
 
 
 def list_schedules(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
-        "SELECT * FROM schedules ORDER BY enabled DESC, next_run IS NULL, next_run, id"
+        _SCHEDULE_SELECT + " ORDER BY s.enabled DESC, s.next_run IS NULL, s.next_run, s.id"
     ).fetchall()
 
 
@@ -410,6 +565,7 @@ def update_schedule(
     merged = {c: row[c] for c in _SCHEDULE_COLS}
     merged.update({k: v for k, v in changes.items() if k in _SCHEDULE_COLS})
     v = _validate_schedule(merged, get_tz(conn), now=now)
+    _check_destination_exists(conn, v["destination_id"])
     enabled = int(changes["enabled"]) if "enabled" in changes else row["enabled"]
     nxt = v["_next"]
     conn.execute(
@@ -434,8 +590,8 @@ def due_schedules(conn: sqlite3.Connection, now: Optional[datetime] = None) -> l
     """実行時刻を過ぎている有効な予約（古い順）。"""
     now = now or utc_now()
     return conn.execute(
-        "SELECT * FROM schedules WHERE enabled = 1 AND next_run IS NOT NULL AND next_run <= ? "
-        "ORDER BY next_run, id",
+        _SCHEDULE_SELECT + " WHERE s.enabled = 1 AND s.next_run IS NOT NULL AND s.next_run <= ? "
+        "ORDER BY s.next_run, s.id",
         (to_utc_str(now),),
     ).fetchall()
 
@@ -479,7 +635,7 @@ def _validate_birthday(f: dict[str, Any]) -> dict[str, Any]:
     if day is None or not (1 <= int(day) <= _last_day(2024, int(month))):  # 2024=うるう年
         raise ValueError("その月に存在しない日付です")
     out["month"], out["day"] = int(month), int(day)
-    out["webhook_url"] = validate_webhook(f.get("webhook_url", ""))
+    out["destination_id"] = _clean_destination_id(f.get("destination_id"))
 
     template = (f.get("template") or "").strip()
     out["template"] = template or "{name}さん、お誕生日おめでとうございます！"
@@ -498,26 +654,34 @@ def _validate_birthday(f: dict[str, Any]) -> dict[str, Any]:
 
 
 _BIRTHDAY_COLS = (
-    "name", "month", "day", "webhook_url", "template", "discord_id", "missed_policy",
+    "name", "month", "day", "destination_id", "template", "discord_id", "missed_policy",
+)
+
+_BIRTHDAY_SELECT = (
+    "SELECT b.id, b.name, b.month, b.day, b.destination_id, d.name AS destination_name, "
+    "COALESCE(d.webhook_url, b.webhook_url) AS webhook_url, "
+    "b.template, b.discord_id, b.missed_policy, b.enabled, b.last_handled_on, b.created_at "
+    "FROM birthdays b LEFT JOIN destinations d ON d.id = b.destination_id"
 )
 
 
 def add_birthday(conn: sqlite3.Connection, *, now: Optional[datetime] = None, **fields: Any) -> int:
     v = _validate_birthday(fields)
+    _check_destination_exists(conn, v["destination_id"])
     cur = conn.execute(
-        f"INSERT INTO birthdays ({', '.join(_BIRTHDAY_COLS)}, enabled, created_at) "
-        f"VALUES ({', '.join('?' for _ in _BIRTHDAY_COLS)}, 1, ?)",
+        f"INSERT INTO birthdays ({', '.join(_BIRTHDAY_COLS)}, webhook_url, enabled, created_at) "
+        f"VALUES ({', '.join('?' for _ in _BIRTHDAY_COLS)}, '', 1, ?)",
         [v[c] for c in _BIRTHDAY_COLS] + [to_utc_str(now or utc_now())],
     )
     return int(cur.lastrowid)
 
 
 def get_birthday(conn: sqlite3.Connection, birthday_id: int) -> Optional[sqlite3.Row]:
-    return conn.execute("SELECT * FROM birthdays WHERE id = ?", (birthday_id,)).fetchone()
+    return conn.execute(_BIRTHDAY_SELECT + " WHERE b.id = ?", (birthday_id,)).fetchone()
 
 
 def list_birthdays(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return conn.execute("SELECT * FROM birthdays ORDER BY month, day, id").fetchall()
+    return conn.execute(_BIRTHDAY_SELECT + " ORDER BY b.month, b.day, b.id").fetchall()
 
 
 def update_birthday(conn: sqlite3.Connection, birthday_id: int, **changes: Any) -> None:
@@ -527,6 +691,7 @@ def update_birthday(conn: sqlite3.Connection, birthday_id: int, **changes: Any) 
     merged = {c: row[c] for c in _BIRTHDAY_COLS}
     merged.update({k: v for k, v in changes.items() if k in _BIRTHDAY_COLS})
     v = _validate_birthday(merged)
+    _check_destination_exists(conn, v["destination_id"])
     enabled = int(changes["enabled"]) if "enabled" in changes else row["enabled"]
     conn.execute(
         f"UPDATE birthdays SET {', '.join(c + ' = ?' for c in _BIRTHDAY_COLS)}, enabled = ? "
@@ -542,12 +707,12 @@ def delete_birthday(conn: sqlite3.Connection, birthday_id: int) -> None:
 def birthdays_on(conn: sqlite3.Connection, d: date) -> list[sqlite3.Row]:
     """その日が誕生日の人（有効なもの）。2/29 生まれは平年なら 2/28 に祝う。"""
     rows = conn.execute(
-        "SELECT * FROM birthdays WHERE enabled = 1 AND month = ? AND day = ? ORDER BY id",
+        _BIRTHDAY_SELECT + " WHERE b.enabled = 1 AND b.month = ? AND b.day = ? ORDER BY b.id",
         (d.month, d.day),
     ).fetchall()
     if d.month == 2 and d.day == 28 and not calendar.isleap(d.year):
         rows += conn.execute(
-            "SELECT * FROM birthdays WHERE enabled = 1 AND month = 2 AND day = 29 ORDER BY id"
+            _BIRTHDAY_SELECT + " WHERE b.enabled = 1 AND b.month = 2 AND b.day = 29 ORDER BY b.id"
         ).fetchall()
     return rows
 

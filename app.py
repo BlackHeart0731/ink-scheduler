@@ -7,15 +7,19 @@ Ink Scheduler - app.py（管理画面）
 環境変数:
     INK_SCHEDULER_DB        DBファイルの場所（省略時は db.py と同じフォルダの data/scheduler.db）
     INK_SCHEDULER_PASSWORD  設定すると、画面を開くときにパスワードを求める
+                            （一度ログインすると、そのブラウザでは30日間ログイン状態が続く）
 
-画面は予約・誕生日・設定を編集するだけ。実際の送信は sender.py が行う（別プロセス）。
+画面は予約・誕生日・送信先・設定を編集するだけ。実際の送信は sender.py が行う（別プロセス）。
 Webhook URL は秘密情報なので、画面には末尾4文字だけ表示する。
+Enter キーで保存や追加が実行されないよう、入力欄は st.form を使わず「ボタンを押したときだけ」実行する。
 """
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import os
+import time
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -32,27 +36,79 @@ STATUS_LABELS = {"sent": "送信", "failed": "失敗", "notified": "通知", "sk
 SOURCE_LABELS = {"schedule": "予約", "birthday": "誕生日", "system": "システム"}
 WEEKDAYS = "月火水木金土日"
 DAY_CHOICES = list(range(1, 32)) + [-1]
-NEW_URL = "__new__"
-KEEP_URL = "__keep__"
+
+AUTH_COOKIE = "ink_scheduler_auth"
+AUTH_DAYS = 30
 
 
 # ----------------------------------------------------------------------
 # 共通
 # ----------------------------------------------------------------------
 
+def _auth_key(password: str) -> bytes:
+    return hashlib.sha256(("ink-scheduler-auth:" + password).encode()).digest()
+
+
+def make_token(password: str, *, now: float | None = None) -> str:
+    """ログイン保持用のトークン「期限.署名」。パスワードを変えると全員のトークンが無効になる。"""
+    exp = int((now if now is not None else time.time()) + AUTH_DAYS * 86400)
+    sig = hmac.new(_auth_key(password), str(exp).encode(), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def token_valid(token: str, password: str, *, now: float | None = None) -> bool:
+    try:
+        exp_s, sig = (token or "").split(".", 1)
+        exp = int(exp_s)
+    except ValueError:
+        return False
+    expected = hmac.new(_auth_key(password), exp_s.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig.encode(), expected.encode()) and exp > (now if now is not None else time.time())
+
+
+def run_js(code: str) -> None:
+    """画面に JavaScript を1回流す（cookie の設定用。ユーザー入力は含めないこと）。"""
+    st.html(f"<script>{code}</script>", unsafe_allow_javascript=True)
+
+
 def require_login() -> None:
     password = os.environ.get("INK_SCHEDULER_PASSWORD", "")
-    if not password or st.session_state.get("authed"):
+    if not password:
         return
+    if st.session_state.get("authed"):
+        token = st.session_state.pop("_set_cookie", None)
+        if token:  # ログイン直後の1回だけ、ブラウザに保持用の cookie を置く
+            run_js(f"document.cookie='{AUTH_COOKIE}={token}; max-age={AUTH_DAYS * 86400}; path=/; SameSite=Lax';")
+        return
+    # ログアウト直後は、古い cookie があっても自動ログインしない
+    if not st.session_state.get("_logged_out"):
+        cookie = st.context.cookies.get(AUTH_COOKIE, "")
+        if cookie and token_valid(cookie, password):
+            st.session_state["authed"] = True
+            return
     st.title("Ink Scheduler")
-    entered = st.text_input("パスワード", type="password", key="login_pw")
-    if st.button("ログイン", key="login_btn"):
+    if st.session_state.pop("_clear_cookie", False):
+        run_js(f"document.cookie='{AUTH_COOKIE}=; max-age=0; path=/; SameSite=Lax';")
+    # ここだけは Enter でログインできるよう st.form を使う（データは変更しない）
+    with st.form("login_form"):
+        entered = st.text_input("パスワード", type="password", key="login_pw")
+        submitted = st.form_submit_button("ログイン")
+    if submitted:
         if hmac.compare_digest(entered.encode(), password.encode()):
             st.session_state["authed"] = True
+            st.session_state["_logged_out"] = False
+            st.session_state["_set_cookie"] = make_token(password)
             st.rerun()
         else:
             st.error("パスワードが違います")
     st.stop()
+
+
+def logout() -> None:
+    st.session_state["authed"] = False
+    st.session_state["_logged_out"] = True
+    st.session_state["_clear_cookie"] = True
+    st.rerun()
 
 
 @st.cache_resource
@@ -115,32 +171,18 @@ def schedule_state(r) -> str:
     return "完了" if (r["kind"] == "once" and r["last_run"]) else "停止"
 
 
-def used_webhooks(conn) -> list[str]:
-    urls = {r["webhook_url"] for r in db.list_schedules(conn)}
-    urls |= {r["webhook_url"] for r in db.list_birthdays(conn)}
-    return sorted(urls)
-
-
-def webhook_input(conn, key: str, *, keep: str | None = None) -> str:
-    """送信先の選択。フォーム内でも動くよう、選択欄と入力欄を両方出す。"""
-    options: list[tuple[str, str]] = []
-    if keep:
-        options.append((KEEP_URL, f"今のまま（{db.mask_webhook(keep)}）"))
-    for u in used_webhooks(conn):
-        if u != keep:
-            options.append((u, f"使用中のURLを使う（{db.mask_webhook(u)}）"))
-    options.append((NEW_URL, "新しいURLを入力する"))
-    idx = st.selectbox(
-        "送信先", range(len(options)), format_func=lambda i: options[i][1], key=f"{key}_wh_choice"
+def destination_input(conn, key: str, *, current: int | None = None) -> int | None:
+    """送信先をプルダウンで選ぶ。登録がなければ案内を出して None を返す。"""
+    dests = db.list_destinations(conn)
+    if not dests:
+        st.warning("送信先がまだ登録されていません。「送信先」タブで先に登録してください。")
+        return None
+    labels = {d["id"]: f"{d['name']}（{db.mask_webhook(d['webhook_url'])}）" for d in dests}
+    ids = list(labels)
+    return st.selectbox(
+        "送信先", ids, index=ids.index(current) if current in ids else 0,
+        format_func=labels.get, key=f"{key}_dest",
     )
-    new = st.text_input(
-        "新しいURL（上で「新しいURLを入力する」を選んだときだけ使います）",
-        type="password", key=f"{key}_wh_new", placeholder="https://discord.com/api/webhooks/…",
-    )
-    value = options[idx][0]
-    if value == NEW_URL:
-        return new.strip()
-    return keep if value == KEEP_URL else value
 
 
 def schedule_timing_fields(kind: str, key: str, tz: ZoneInfo, d=None) -> dict:
@@ -203,7 +245,7 @@ def render_schedules(conn, tz: ZoneInfo) -> None:
                 {
                     "ID": r["id"], "名前": r["name"], "タイミング": describe_schedule(r),
                     "次回": local_str(r["next_run"], tz) if r["enabled"] else "—",
-                    "送信先": db.mask_webhook(r["webhook_url"]),
+                    "送信先": r["destination_name"] or "（未設定）",
                     "取りこぼし": POLICY_LABELS[r["missed_policy"]], "状態": schedule_state(r),
                     "本文": r["content"].replace("\n", " ")[:40],
                 }
@@ -212,27 +254,26 @@ def render_schedules(conn, tz: ZoneInfo) -> None:
             hide_index=True, width="stretch",
         )
     else:
-        st.info("まだ予約がありません。下のフォームから追加してください。")
+        st.info("まだ予約がありません。下から追加してください。")
 
     st.subheader("予約を追加")
     n = nonce("add_sched")
     kind = st.radio(
         "種類", list(KIND_LABELS), format_func=KIND_LABELS.get, horizontal=True, key=f"as_kind_{n}"
     )
-    with st.form(f"as_form_{n}"):
-        name = st.text_input("名前（管理用）", key=f"as_name_{n}")
-        content = st.text_area("本文", key=f"as_content_{n}", height=120, help="Discord に送る文章です（2000文字まで）")
-        url = webhook_input(conn, f"as_{n}")
-        timing = schedule_timing_fields(kind, f"as_{n}", tz)
-        policy = st.selectbox(
-            "取りこぼし時の動作", list(POLICY_LABELS), format_func=POLICY_LABELS.get, key=f"as_pol_{n}",
-            help="NUC停止などで予定時刻を過ぎたときの動作です",
-        )
-        submitted = st.form_submit_button("追加する", key=f"as_submit_{n}")
-    if submitted:
+    name = st.text_input("名前（管理用）", key=f"as_name_{n}")
+    content = st.text_area("本文", key=f"as_content_{n}", height=120, help="Discord に送る文章です（2000文字まで）")
+    dest_id = destination_input(conn, f"as_{n}")
+    timing = schedule_timing_fields(kind, f"as_{n}", tz)
+    policy = st.selectbox(
+        "取りこぼし時の動作", list(POLICY_LABELS), format_func=POLICY_LABELS.get, key=f"as_pol_{n}",
+        help="NUC停止などで予定時刻を過ぎたときの動作です",
+    )
+    if st.button("追加する", key=f"as_submit_{n}", disabled=dest_id is None):
         try:
             new_id = db.add_schedule(
-                conn, name=name, webhook_url=url, content=content, kind=kind, missed_policy=policy, **timing
+                conn, name=name, destination_id=dest_id, content=content, kind=kind,
+                missed_policy=policy, **timing,
             )
         except ValueError as e:
             st.error(str(e))
@@ -274,21 +315,19 @@ def render_schedules(conn, tz: ZoneInfo) -> None:
         done(conn, "削除しました")
 
     with st.expander("この予約を編集"):
-        with st.form(f"es_form_{sel}"):
-            e_name = st.text_input("名前", value=row["name"], key=f"es_{sel}_name")
-            e_content = st.text_area("本文", value=row["content"], key=f"es_{sel}_content", height=120)
-            e_url = webhook_input(conn, f"es_{sel}", keep=row["webhook_url"])
-            e_timing = schedule_timing_fields(row["kind"], f"es_{sel}", tz, row)
-            e_policy = st.selectbox(
-                "取りこぼし時の動作", list(POLICY_LABELS), format_func=POLICY_LABELS.get,
-                index=list(POLICY_LABELS).index(row["missed_policy"]), key=f"es_{sel}_pol",
-            )
-            st.caption(f"種類は「{KIND_LABELS[row['kind']]}」のままです。変えたい場合は、削除して追加し直してください。")
-            saved = st.form_submit_button("保存する", key=f"es_submit_{sel}")
-        if saved:
+        e_name = st.text_input("名前", value=row["name"], key=f"es_{sel}_name")
+        e_content = st.text_area("本文", value=row["content"], key=f"es_{sel}_content", height=120)
+        e_dest = destination_input(conn, f"es_{sel}", current=row["destination_id"])
+        e_timing = schedule_timing_fields(row["kind"], f"es_{sel}", tz, row)
+        e_policy = st.selectbox(
+            "取りこぼし時の動作", list(POLICY_LABELS), format_func=POLICY_LABELS.get,
+            index=list(POLICY_LABELS).index(row["missed_policy"]), key=f"es_{sel}_pol",
+        )
+        st.caption(f"種類は「{KIND_LABELS[row['kind']]}」のままです。変えたい場合は、削除して追加し直してください。")
+        if st.button("保存する", key=f"es_submit_{sel}", disabled=e_dest is None):
             try:
                 db.update_schedule(
-                    conn, sel, name=e_name, content=e_content, webhook_url=e_url,
+                    conn, sel, name=e_name, content=e_content, destination_id=e_dest,
                     missed_policy=e_policy, **e_timing,
                 )
             except ValueError as e:
@@ -309,7 +348,7 @@ def render_birthdays(conn) -> None:
             [
                 {
                     "ID": r["id"], "名前": r["name"], "誕生日": f"{r['month']}月{r['day']}日",
-                    "送信先": db.mask_webhook(r["webhook_url"]), "Discord ID": r["discord_id"] or "—",
+                    "送信先": r["destination_name"] or "（未設定）", "Discord ID": r["discord_id"] or "—",
                     "取りこぼし": POLICY_LABELS[r["missed_policy"]], "状態": "有効" if r["enabled"] else "停止",
                     "テンプレート": r["template"].replace("\n", " ")[:40],
                 }
@@ -318,7 +357,7 @@ def render_birthdays(conn) -> None:
             hide_index=True, width="stretch",
         )
     else:
-        st.info("まだ誕生日がありません。下のフォームから追加してください。")
+        st.info("まだ誕生日がありません。下から追加してください。")
     st.caption(
         "誕生日は月日だけ保存します（年は保存しません）。送信時刻は「設定」で変えられます。"
         "2月29日生まれは、うるう年以外は2月28日に送ります。"
@@ -326,26 +365,24 @@ def render_birthdays(conn) -> None:
 
     st.subheader("誕生日を追加")
     n = nonce("add_bd")
-    with st.form(f"ab_form_{n}"):
-        name = st.text_input("名前", key=f"ab_name_{n}")
-        c1, c2 = st.columns(2)
-        month = c1.selectbox("月", range(1, 13), format_func=lambda m: f"{m}月", key=f"ab_mo_{n}")
-        day = c2.selectbox("日", range(1, 32), format_func=lambda d: f"{d}日", key=f"ab_day_{n}")
-        url = webhook_input(conn, f"ab_{n}")
-        template = st.text_area(
-            "メッセージ", value="{name}さん、お誕生日おめでとうございます！", key=f"ab_tpl_{n}", height=100,
-            help="{name} が名前に置き換わります",
-        )
-        discord_id = st.text_input("Discord ID（任意）", key=f"ab_did_{n}", help="入れると <@ID> でメンションします")
-        policy = st.selectbox(
-            "取りこぼし時の動作", list(POLICY_LABELS), format_func=POLICY_LABELS.get,
-            index=list(POLICY_LABELS).index("late_send"), key=f"ab_pol_{n}",
-        )
-        submitted = st.form_submit_button("追加する", key=f"ab_submit_{n}")
-    if submitted:
+    name = st.text_input("名前", key=f"ab_name_{n}")
+    c1, c2 = st.columns(2)
+    month = c1.selectbox("月", range(1, 13), format_func=lambda m: f"{m}月", key=f"ab_mo_{n}")
+    day = c2.selectbox("日", range(1, 32), format_func=lambda d: f"{d}日", key=f"ab_day_{n}")
+    dest_id = destination_input(conn, f"ab_{n}")
+    template = st.text_area(
+        "メッセージ", value="{name}さん、お誕生日おめでとうございます！", key=f"ab_tpl_{n}", height=100,
+        help="{name} が名前に置き換わります",
+    )
+    discord_id = st.text_input("Discord ID（任意）", key=f"ab_did_{n}", help="入れると <@ID> でメンションします")
+    policy = st.selectbox(
+        "取りこぼし時の動作", list(POLICY_LABELS), format_func=POLICY_LABELS.get,
+        index=list(POLICY_LABELS).index("late_send"), key=f"ab_pol_{n}",
+    )
+    if st.button("追加する", key=f"ab_submit_{n}", disabled=dest_id is None):
         try:
             new_id = db.add_birthday(
-                conn, name=name, month=month, day=day, webhook_url=url,
+                conn, name=name, month=month, day=day, destination_id=dest_id,
                 template=template, discord_id=discord_id, missed_policy=policy,
             )
         except ValueError as e:
@@ -383,33 +420,121 @@ def render_birthdays(conn) -> None:
         done(conn, "削除しました")
 
     with st.expander("この誕生日を編集"):
-        with st.form(f"eb_form_{sel}"):
-            e_name = st.text_input("名前", value=row["name"], key=f"eb_{sel}_name")
-            c1, c2 = st.columns(2)
-            e_month = c1.selectbox(
-                "月", range(1, 13), index=row["month"] - 1, format_func=lambda m: f"{m}月", key=f"eb_{sel}_mo"
-            )
-            e_day = c2.selectbox(
-                "日", range(1, 32), index=row["day"] - 1, format_func=lambda d: f"{d}日", key=f"eb_{sel}_day"
-            )
-            e_url = webhook_input(conn, f"eb_{sel}", keep=row["webhook_url"])
-            e_tpl = st.text_area("メッセージ", value=row["template"], key=f"eb_{sel}_tpl", height=100)
-            e_did = st.text_input("Discord ID（任意）", value=row["discord_id"] or "", key=f"eb_{sel}_did")
-            e_policy = st.selectbox(
-                "取りこぼし時の動作", list(POLICY_LABELS), format_func=POLICY_LABELS.get,
-                index=list(POLICY_LABELS).index(row["missed_policy"]), key=f"eb_{sel}_pol",
-            )
-            saved = st.form_submit_button("保存する", key=f"eb_submit_{sel}")
-        if saved:
+        e_name = st.text_input("名前", value=row["name"], key=f"eb_{sel}_name")
+        c1, c2 = st.columns(2)
+        e_month = c1.selectbox(
+            "月", range(1, 13), index=row["month"] - 1, format_func=lambda m: f"{m}月", key=f"eb_{sel}_mo"
+        )
+        e_day = c2.selectbox(
+            "日", range(1, 32), index=row["day"] - 1, format_func=lambda d: f"{d}日", key=f"eb_{sel}_day"
+        )
+        e_dest = destination_input(conn, f"eb_{sel}", current=row["destination_id"])
+        e_tpl = st.text_area("メッセージ", value=row["template"], key=f"eb_{sel}_tpl", height=100)
+        e_did = st.text_input("Discord ID（任意）", value=row["discord_id"] or "", key=f"eb_{sel}_did")
+        e_policy = st.selectbox(
+            "取りこぼし時の動作", list(POLICY_LABELS), format_func=POLICY_LABELS.get,
+            index=list(POLICY_LABELS).index(row["missed_policy"]), key=f"eb_{sel}_pol",
+        )
+        if st.button("保存する", key=f"eb_submit_{sel}", disabled=e_dest is None):
             try:
                 db.update_birthday(
-                    conn, sel, name=e_name, month=e_month, day=e_day, webhook_url=e_url,
+                    conn, sel, name=e_name, month=e_month, day=e_day, destination_id=e_dest,
                     template=e_tpl, discord_id=e_did, missed_policy=e_policy,
                 )
             except ValueError as e:
                 st.error(str(e))
             else:
                 done(conn, "保存しました")
+
+
+# ----------------------------------------------------------------------
+# 送信先
+# ----------------------------------------------------------------------
+
+def send_test(url: str, label: str) -> None:
+    res = sender.post_webhook(url, sender.review_payload(f"【接続テスト】Ink Scheduler から「{label}」へ送信できています。"))
+    if res.ok:
+        st.success("送信できました。Discord のチャンネルを確認してください。")
+    else:
+        st.error(f"送信できませんでした: {res.detail}")
+
+
+def render_destinations(conn) -> None:
+    rows = db.list_destinations(conn)
+    st.subheader("送信先の一覧")
+    st.caption(
+        "予約・誕生日を送る Discord チャンネルの Webhook を、名前をつけて登録します。"
+        "予約や誕生日を作るときに、ここから選べます。URL は末尾4文字だけ表示します。"
+    )
+    if rows:
+        st.dataframe(
+            [
+                {
+                    "ID": r["id"], "名前": r["name"], "URL": db.mask_webhook(r["webhook_url"]),
+                    "使用中": f"予約 {r['schedule_count']} 件・誕生日 {r['birthday_count']} 件",
+                }
+                for r in rows
+            ],
+            hide_index=True, width="stretch",
+        )
+    else:
+        st.info("まだ送信先がありません。下から追加してください。")
+
+    st.subheader("送信先を追加")
+    n = nonce("add_dest")
+    name = st.text_input("名前", key=f"ad_name_{n}", placeholder="例: お知らせ / 雑談 / スタッフ連絡")
+    url = st.text_input("Webhook URL", type="password", key=f"ad_url_{n}", placeholder="https://discord.com/api/webhooks/…")
+    c1, c2, _ = st.columns([1, 1, 4])
+    if c1.button("追加する", key=f"ad_add_{n}"):
+        try:
+            new_id = db.add_destination(conn, name=name, webhook_url=url)
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            bump("add_dest")
+            done(conn, f"送信先を追加しました（#{new_id}）")
+    if c2.button("テスト送信", key=f"ad_test_{n}"):
+        try:
+            send_test(db.validate_webhook(url), name.strip() or "新しい送信先")
+        except ValueError as e:
+            st.error(str(e))
+
+    if not rows:
+        return
+    st.subheader("送信先を操作")
+    ids = [r["id"] for r in rows]
+    sel = st.selectbox(
+        "対象", ids, key="dest_sel",
+        format_func=lambda i: next(f"#{r['id']} {r['name']}" for r in rows if r["id"] == i),
+    )
+    row = next(r for r in rows if r["id"] == sel)
+    e_name = st.text_input("名前", value=row["name"], key=f"ed_{sel}_name")
+    e_url = st.text_input(
+        "新しいURL（変えるときだけ入力。空なら今のまま）", type="password", key=f"ed_{sel}_url",
+        placeholder="https://discord.com/api/webhooks/…",
+    )
+    confirm = st.checkbox("確認しました（削除に必要）", key=f"dest_confirm_{sel}")
+    c1, c2, c3 = st.columns(3)
+    if c1.button("保存する", key=f"ed_save_{sel}"):
+        try:
+            db.update_destination(conn, sel, name=e_name, webhook_url=e_url)
+        except ValueError as e:
+            conn.rollback()
+            st.error(str(e))
+        else:
+            done(conn, "保存しました")
+    if c2.button("テスト送信", key=f"ed_test_{sel}"):
+        try:
+            send_test(db.validate_webhook(e_url.strip() or row["webhook_url"]), e_name.strip() or row["name"])
+        except ValueError as e:
+            st.error(str(e))
+    if c3.button("削除する", key=f"ed_del_{sel}", disabled=not confirm):
+        try:
+            db.delete_destination(conn, sel)
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            done(conn, "削除しました")
 
 
 # ----------------------------------------------------------------------
@@ -447,18 +572,16 @@ def render_logs(conn, tz: ZoneInfo) -> None:
 
 def render_settings(conn) -> None:
     st.subheader("基本設定")
-    with st.form("settings_form"):
-        tzname = st.text_input("タイムゾーン", value=db.get_setting(conn, "timezone"), help="例: Asia/Tokyo")
-        btime = st.time_input(
-            "誕生日の送信時刻", value=dtime.fromisoformat(db.get_setting(conn, "birthday_time")), step=60
-        )
-        catchup = st.number_input(
-            "予約を遅れて送る許容時間（時間）", min_value=0, max_value=168, step=1,
-            value=int(db.get_setting(conn, "catchup_hours")),
-            help="「遅れて送る」の予約が、この時間以内なら送ります。誕生日は当日中です",
-        )
-        saved = st.form_submit_button("保存する", key="settings_submit")
-    if saved:
+    tzname = st.text_input("タイムゾーン", value=db.get_setting(conn, "timezone"), help="例: Asia/Tokyo")
+    btime = st.time_input(
+        "誕生日の送信時刻", value=dtime.fromisoformat(db.get_setting(conn, "birthday_time")), step=60
+    )
+    catchup = st.number_input(
+        "予約を遅れて送る許容時間（時間）", min_value=0, max_value=168, step=1,
+        value=int(db.get_setting(conn, "catchup_hours")),
+        help="「遅れて送る」の予約が、この時間以内なら送ります。誕生日は当日中です",
+    )
+    if st.button("保存する", key="settings_submit"):
         try:
             old_tz = db.get_setting(conn, "timezone")
             db.set_setting(conn, "timezone", tzname)
@@ -473,7 +596,10 @@ def render_settings(conn) -> None:
             done(conn, "設定を保存しました")
 
     st.subheader("確認用Webhook（取りこぼしの通知先）")
-    st.caption("所長だけが見られる非公開チャンネルのWebhookを入れてください。予約本文が引用されます。")
+    st.caption(
+        "NUC停止などで送れなかった予約・誕生日の「確認通知」が届く先です。予約本文が引用されるので、"
+        "自分だけが見られる非公開チャンネルをおすすめします。上の「送信先」とは別に1つだけ登録します。"
+    )
     current = db.get_setting(conn, "review_webhook_url")
     st.write("現在: " + (db.mask_webhook(current) if current else "未設定"))
     new_url = st.text_input(
@@ -489,20 +615,19 @@ def render_settings(conn) -> None:
         else:
             done(conn, "確認用Webhookを保存しました")
     if c2.button("テスト送信", key="rv_test"):
-        url = new_url.strip() or current
         try:
-            url = db.validate_webhook(url)
+            send_test(db.validate_webhook(new_url.strip() or current), "確認用Webhook")
         except ValueError as e:
             st.error(str(e))
-        else:
-            res = sender.post_webhook(url, sender.review_payload("【接続テスト】Ink Scheduler から確認用Webhookへ送信できています。"))
-            if res.ok:
-                st.success("送信できました。Discord のチャンネルを確認してください。")
-            else:
-                st.error(f"送信できませんでした: {res.detail}")
     if c3.button("設定を消す", key="rv_clear", disabled=not current):
         db.set_setting(conn, "review_webhook_url", "")
         done(conn, "確認用Webhookを消しました")
+
+    if os.environ.get("INK_SCHEDULER_PASSWORD"):
+        st.subheader("ログイン")
+        st.caption(f"このブラウザは、ログインしてから{AUTH_DAYS}日間、パスワードなしで開けます。")
+        if st.button("ログアウトする", key="logout_btn"):
+            logout()
 
 
 # ----------------------------------------------------------------------
@@ -520,16 +645,20 @@ def main() -> None:
         needs_review = any(r["missed_policy"] == "notify" for r in db.list_schedules(conn)) or any(
             r["missed_policy"] == "notify" for r in db.list_birthdays(conn)
         )
+        if not db.list_destinations(conn):
+            st.info("まず「送信先」タブで、送信先（Discord の Webhook）を登録してください。予約と誕生日はそこから選びます。")
         if needs_review and not db.get_setting(conn, "review_webhook_url"):
             st.warning(
                 "取りこぼし時の動作が「確認通知」の項目がありますが、確認用Webhookが未設定です。"
                 "「設定」タブで登録してください（未設定のままだと通知されず、スキップされます）。"
             )
-        tab_s, tab_b, tab_l, tab_c = st.tabs(["予約", "誕生日", "履歴", "設定"])
+        tab_s, tab_b, tab_d, tab_l, tab_c = st.tabs(["予約", "誕生日", "送信先", "履歴", "設定"])
         with tab_s:
             render_schedules(conn, tz)
         with tab_b:
             render_birthdays(conn)
+        with tab_d:
+            render_destinations(conn)
         with tab_l:
             render_logs(conn, tz)
         with tab_c:
