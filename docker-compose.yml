@@ -1,0 +1,49 @@
+# Ink Scheduler
+#   sender: 時刻になった予約・誕生日を送る（常駐）
+#   admin : 予約・誕生日・設定を編集する管理画面
+# 2つは同じイメージ・同じ ./data（SQLite）を使う。
+#
+# 起動:   docker compose up -d --build
+# 停止:   docker compose down
+# ログ:   docker compose logs -f sender
+
+x-app: &app
+  build: .
+  image: ink-scheduler:latest
+  user: "${APP_UID:-1000}:${APP_GID:-1000}"
+  restart: unless-stopped
+  volumes:
+    - ./data:/app/data
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  sender:
+    <<: *app
+    command: ["python", "sender.py"]
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+
+  admin:
+    <<: *app
+    command:
+      - streamlit
+      - run
+      - app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      INK_SCHEDULER_PASSWORD: ${INK_SCHEDULER_PASSWORD:-}
+    ports:
+      # 既定はそのPC内だけ。同じネットワークの他のPCから開くときは、.env で ADMIN_BIND=0.0.0.0 にする
+      - "${ADMIN_BIND:-127.0.0.1}:${ADMIN_PORT:-8501}:8501"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
