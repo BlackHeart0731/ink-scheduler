@@ -29,7 +29,7 @@ Discord に、決めた日時でメッセージを自動投稿するツールで
 ## 導入
 
 ```
-git clone <このリポジトリのURL> ink-scheduler
+git clone https://github.com/BlackHeart0731/ink-scheduler.git ink-scheduler
 cd ink-scheduler
 cp .env.example .env
 ```
@@ -175,3 +175,7 @@ docker compose exec admin python db.py backup
 - 誕生日のメッセージは、メンション（`<@ID>`）した本人にだけ通知が届きます。名前の中の `@everyone` などは、通知されません。
 - 履歴は、180日より古いものから自動で消えます。
 - Discord の Webhook には、1回の本文が 2000 文字までという上限があります。
+
+## ライセンス
+
+MIT ライセンスです。自由に使ったり、変えたり、配ったりできます。ただし無保証です（詳しくは `LICENSE`）。大事な予約は、バックアップを取ったうえで、自己責任でお使いください。
