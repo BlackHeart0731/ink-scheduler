@@ -20,6 +20,7 @@ import hmac
 import os
 import re
 import sqlite3
+import shutil
 import sys
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -46,6 +47,8 @@ DEFAULT_SETTINGS = {
     "admin_password": "",        # 管理画面のパスワード（ハッシュ。空なら環境変数の初期値を使う）
 }
 PASSWORD_MIN_LEN = 8
+BACKUP_KEEP_DAYS = 14        # 自動バックアップを何日分残すか
+BACKUP_TABLES = ("settings", "schedules", "birthdays", "logs")
 
 WEBHOOK_RE = re.compile(
     r"^https://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api(?:/v\d+)?/webhooks/\d+/[\w-]+/?$"
@@ -768,6 +771,125 @@ def render_birthday_message(row: sqlite3.Row) -> str:
 
 
 # ----------------------------------------------------------------------
+# バックアップ・復元
+#   data/backups/ に保存する。SQLite の backup API を使うので、動いている最中でも壊れずにコピーできる。
+#   自動:  scheduler-auto-YYYYMMDD.db （1日1回。古いものから消して BACKUP_KEEP_DAYS 件だけ残す）
+#   手動:  scheduler-manual-YYYYMMDD-HHMMSS.db
+#   復元前: scheduler-before-restore-YYYYMMDD-HHMMSS.db （復元する直前の状態。消さない）
+# ----------------------------------------------------------------------
+
+def backup_dir() -> Path:
+    return get_db_path().parent / "backups"
+
+
+def _copy_db(dest: Path) -> Path:
+    """いまのDBを dest にコピーする（一時ファイルに書いてから置き換えるので、途中で止まっても半端なファイルが残らない）。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    src = sqlite3.connect(get_db_path(), timeout=10)
+    try:
+        dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    tmp.replace(dest)
+    return dest
+
+
+def _stamp(now: Optional[datetime], fmt: str) -> str:
+    return (now or utc_now()).strftime(fmt)
+
+
+def make_backup(kind: str = "manual", *, now: Optional[datetime] = None) -> Path:
+    """kind: manual / before-restore。自動バックアップは ensure_daily_backup を使う。"""
+    if kind not in ("manual", "before-restore"):
+        raise ValueError(f"未知のバックアップ種別です: {kind}")
+    return _copy_db(backup_dir() / f"scheduler-{kind}-{_stamp(now, '%Y%m%d-%H%M%S')}.db")
+
+
+def prune_backups(keep: int = BACKUP_KEEP_DAYS) -> list[Path]:
+    """自動バックアップだけを、新しい順に keep 件残して削除する（手動・復元前のものは消さない）。"""
+    autos = sorted(backup_dir().glob("scheduler-auto-*.db"), reverse=True)
+    removed = autos[keep:]
+    for f in removed:
+        f.unlink(missing_ok=True)
+    return removed
+
+
+def ensure_daily_backup(
+    *, now: Optional[datetime] = None, keep: int = BACKUP_KEEP_DAYS
+) -> Optional[Path]:
+    """その日の自動バックアップがまだ無ければ作る。作ったときだけパスを返す。"""
+    dest = backup_dir() / f"scheduler-auto-{_stamp(now, '%Y%m%d')}.db"
+    if dest.exists():
+        return None
+    _copy_db(dest)
+    prune_backups(keep)
+    return dest
+
+
+def list_backups() -> list[dict[str, Any]]:
+    """新しい順。name / size / mtime（UTC の datetime）。"""
+    out = []
+    for f in backup_dir().glob("scheduler-*.db"):
+        st = f.stat()
+        out.append({"name": f.name, "size": st.st_size, "mtime": datetime.fromtimestamp(st.st_mtime, timezone.utc)})
+    return sorted(out, key=lambda x: x["mtime"], reverse=True)
+
+
+def snapshot_bytes(conn: sqlite3.Connection) -> bytes:
+    """いまのDBの中身をそのまま返す（ダウンロード用）。"""
+    return conn.serialize()
+
+
+def validate_backup_file(path: Path) -> None:
+    """Ink Scheduler のバックアップとして使えるか調べる。ダメなら ValueError（日本語）。"""
+    path = Path(path)
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as e:
+        raise ValueError("ファイルを開けませんでした") from e
+    try:
+        try:
+            result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        except sqlite3.DatabaseError as e:
+            raise ValueError("SQLite のファイルではないか、壊れています") from e
+        if result != "ok":
+            raise ValueError("バックアップファイルが壊れています")
+        missing = [t for t in BACKUP_TABLES if t not in tables]
+        if missing:
+            raise ValueError(f"Ink Scheduler のバックアップではありません（{', '.join(missing)} がありません）")
+    finally:
+        conn.close()
+
+
+def restore_backup(src_path: Path, *, now: Optional[datetime] = None) -> Path:
+    """バックアップでいまのDBを置き換える。置き換える直前の状態を before-restore として残して、そのパスを返す。
+
+    古い形式のバックアップでも、復元後に init_db() で新しい形式へ移行する。
+    """
+    src_path = Path(src_path)
+    validate_backup_file(src_path)
+    saved = make_backup("before-restore", now=now)
+    src = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True)
+    try:
+        dst = sqlite3.connect(get_db_path(), timeout=30)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    init_db()
+    return saved
+
+
+# ----------------------------------------------------------------------
 # 履歴（logs）
 # ----------------------------------------------------------------------
 
@@ -807,11 +929,33 @@ def prune_logs(conn: sqlite3.Connection, keep_days: int = 180, *, now: Optional[
     return conn.execute("DELETE FROM logs WHERE created_at < ?", (cutoff,)).rowcount
 
 
-if __name__ == "__main__":
+def _cli(argv: list[str]) -> int:
     init_db()
-    if "reset-password" in sys.argv[1:]:
+    cmd = argv[0] if argv else "init"
+    if cmd == "backup":
+        print(f"バックアップを作りました: {make_backup('manual')}")
+    elif cmd == "restore":
+        if len(argv) != 2:
+            print("使い方: python db.py restore バックアップファイル")
+            return 2
+        try:
+            saved = restore_backup(Path(argv[1]))
+        except ValueError as e:
+            print(f"復元できませんでした: {e}")
+            return 1
+        print(f"復元しました。復元前の状態は {saved} に残してあります。")
+    elif cmd == "reset-password":
         # パスワードを忘れたとき:  docker compose exec admin python db.py reset-password
-        with connect() as _conn:
-            clear_admin_password(_conn)
+        with connect() as conn:
+            clear_admin_password(conn)
         print("DBに保存したパスワードを消しました。.env の INK_SCHEDULER_PASSWORD（なければパスワードなし）に戻ります。")
-    print(f"DB を初期化しました: {get_db_path()}")
+    elif cmd == "init":
+        print(f"DB を初期化しました: {get_db_path()}")
+    else:
+        print("使い方: python db.py [init | backup | restore ファイル | reset-password]")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli(sys.argv[1:]))

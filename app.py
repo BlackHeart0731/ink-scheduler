@@ -629,7 +629,67 @@ def render_settings(conn) -> None:
         db.set_setting(conn, "review_webhook_url", "")
         done(conn, "確認用Webhookを消しました")
 
+    render_backup(conn)
     render_password(conn)
+
+
+def render_backup(conn) -> None:
+    tz = db.get_tz(conn)
+    st.subheader("バックアップ")
+    st.caption(
+        f"予約・誕生日・送信先・設定を、1日1回、自動で data/backups/ に保存します（最新{db.BACKUP_KEEP_DAYS}日分）。"
+        "同じ機械の中の保存なので、機械ごと壊れたときのために、data/backups/ を別の場所（外付けSSDなど）へも"
+        "コピーしてください。やり方は README を見てください。"
+    )
+    c1, c2 = st.columns(2)
+    if c1.button("いますぐバックアップ", key="bk_now"):
+        conn.commit()
+        path = db.make_backup("manual")
+        done(conn, f"バックアップを作りました（{path.name}）")
+    c2.download_button(
+        "いまのデータをダウンロード（.db）", data=db.snapshot_bytes(conn),
+        file_name=f"ink-scheduler-{datetime.now(tz).strftime('%Y%m%d-%H%M')}.db",
+        mime="application/octet-stream", key="bk_download",
+    )
+    st.caption("ダウンロードしたファイルには Webhook URL がそのまま入っています。他の人に渡さず、安全な場所に保管してください。")
+
+    backups = db.list_backups()
+    if backups:
+        st.dataframe(
+            [
+                {
+                    "ファイル": b["name"], "サイズ": f"{max(1, b['size'] // 1024)} KB",
+                    "作成": b["mtime"].astimezone(tz).strftime("%Y-%m-%d %H:%M"),
+                }
+                for b in backups[:30]
+            ],
+            hide_index=True, width="stretch",
+        )
+    else:
+        st.info("まだバックアップがありません。送信担当（sender）が動いていれば、1日1回自動で作られます。")
+
+    with st.expander("バックアップから復元する"):
+        st.warning(
+            "いまのデータは、選んだバックアップの内容に置き換わります（予約・誕生日・送信先・設定・履歴・パスワードが、"
+            "バックアップを作った時点に戻ります）。置き換える直前の状態は、自動で別に保存します。"
+        )
+        n = nonce("restore")
+        up = st.file_uploader("バックアップファイル（.db）", type=["db"], key=f"bk_up_{n}")
+        confirm = st.checkbox("いまのデータが置き換わることを確認しました", key=f"bk_confirm_{n}")
+        if st.button("復元する", key=f"bk_restore_{n}", disabled=not (up and confirm)):
+            conn.commit()
+            tmp = db.backup_dir() / f"upload-{db.utc_now().strftime('%Y%m%d-%H%M%S')}.tmp"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(up.getvalue())
+            try:
+                saved = db.restore_backup(tmp)
+            except ValueError as e:
+                st.error(f"復元できませんでした: {e}")
+            else:
+                bump("restore")
+                done(conn, f"復元しました（復元前の状態は {saved.name} に残してあります）")
+            finally:
+                tmp.unlink(missing_ok=True)
 
 
 def render_password(conn) -> None:

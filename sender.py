@@ -412,7 +412,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         signal.signal(sig, lambda *_: stop.set())
 
     log.info("起動しました（%s 秒ごとに確認）DB: %s", interval, db.get_db_path())
+    backed_up_on: Optional[date] = None
     while not stop.is_set():
+        today = db.utc_now().date()
+        if backed_up_on != today:  # 1日1回、自動バックアップ（失敗しても送信は止めない）
+            try:
+                made = db.ensure_daily_backup()
+                if made:
+                    log.info("自動バックアップを作りました: %s", made.name)
+                backed_up_on = today
+            except Exception:
+                log.exception("自動バックアップに失敗しました。次回やり直します")
         try:
             with db.connect() as conn:
                 stats = process_due(conn, db.utc_now(), retry=retry)
