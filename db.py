@@ -15,9 +15,12 @@ SQLite層（スキーマ・CRUD・次回実行日時の計算）
 from __future__ import annotations
 
 import calendar
+import hashlib
+import hmac
 import os
 import re
 import sqlite3
+import sys
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -40,7 +43,9 @@ DEFAULT_SETTINGS = {
     "birthday_time": "09:00",
     "catchup_hours": "6",       # 取りこぼし時、この時間以内なら late_send で送る
     "review_webhook_url": "",    # 取りこぼし確認用（所長専用の非公開チャンネル）
+    "admin_password": "",        # 管理画面のパスワード（ハッシュ。空なら環境変数の初期値を使う）
 }
+PASSWORD_MIN_LEN = 8
 
 WEBHOOK_RE = re.compile(
     r"^https://(?:(?:canary|ptb)\.)?discord(?:app)?\.com/api(?:/v\d+)?/webhooks/\d+/[\w-]+/?$"
@@ -255,6 +260,38 @@ def _clamp_day(year: int, month: int, day: int) -> int:
 
 def get_tz(conn: sqlite3.Connection) -> ZoneInfo:
     return ZoneInfo(get_setting(conn, "timezone"))
+
+
+# ----------------------------------------------------------------------
+# 管理画面のパスワード  ※DBにはハッシュだけを保存する
+# ----------------------------------------------------------------------
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        scheme, salt_hex, digest_hex = stored.split("$")
+        if scheme != "scrypt":
+            return False
+        digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1, dklen=32)
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(digest.hex().encode(), digest_hex.encode())
+
+
+def set_admin_password(conn: sqlite3.Connection, new_password: str) -> None:
+    if len(new_password) < PASSWORD_MIN_LEN:
+        raise ValueError(f"パスワードは {PASSWORD_MIN_LEN} 文字以上にしてください")
+    set_setting(conn, "admin_password", hash_password(new_password))
+
+
+def clear_admin_password(conn: sqlite3.Connection) -> None:
+    """DBに保存したパスワードを消す（環境変数 INK_SCHEDULER_PASSWORD の初期値に戻る）。"""
+    conn.execute("DELETE FROM settings WHERE key = 'admin_password'")
 
 
 # ----------------------------------------------------------------------
@@ -772,4 +809,9 @@ def prune_logs(conn: sqlite3.Connection, keep_days: int = 180, *, now: Optional[
 
 if __name__ == "__main__":
     init_db()
+    if "reset-password" in sys.argv[1:]:
+        # パスワードを忘れたとき:  docker compose exec admin python db.py reset-password
+        with connect() as _conn:
+            clear_admin_password(_conn)
+        print("DBに保存したパスワードを消しました。.env の INK_SCHEDULER_PASSWORD（なければパスワードなし）に戻ります。")
     print(f"DB を初期化しました: {get_db_path()}")

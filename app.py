@@ -6,8 +6,9 @@ Ink Scheduler - app.py（管理画面）
 
 環境変数:
     INK_SCHEDULER_DB        DBファイルの場所（省略時は db.py と同じフォルダの data/scheduler.db）
-    INK_SCHEDULER_PASSWORD  設定すると、画面を開くときにパスワードを求める
-                            （一度ログインすると、そのブラウザでは30日間ログイン状態が続く）
+    INK_SCHEDULER_PASSWORD  管理画面のパスワードの初期値。設定すると、画面を開くときにパスワードを求める。
+                            「設定」タブで変更すると、DBに保存した新しいパスワードが優先される。
+                            一度ログインしたブラウザは、ログアウトするまでログイン状態が続く
 
 画面は予約・誕生日・送信先・設定を編集するだけ。実際の送信は sender.py が行う（別プロセス）。
 Webhook URL は秘密情報なので、画面には末尾4文字だけ表示する。
@@ -19,7 +20,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
-import time
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -38,32 +38,38 @@ WEEKDAYS = "月火水木金土日"
 DAY_CHOICES = list(range(1, 32)) + [-1]
 
 AUTH_COOKIE = "ink_scheduler_auth"
-AUTH_DAYS = 30
+AUTH_MAX_AGE = 10 * 365 * 86400  # 実質無期限（ブラウザ側の上限は約400日）
 
 
 # ----------------------------------------------------------------------
 # 共通
 # ----------------------------------------------------------------------
 
-def _auth_key(password: str) -> bytes:
-    return hashlib.sha256(("ink-scheduler-auth:" + password).encode()).digest()
+def current_credential() -> tuple[str, str] | None:
+    """いま有効なパスワード情報。DBに保存したものを優先し、なければ環境変数の初期値。"""
+    with db.connect() as conn:
+        stored = db.get_setting(conn, "admin_password")
+    if stored:
+        return ("db", stored)
+    env = os.environ.get("INK_SCHEDULER_PASSWORD", "")
+    return ("env", env) if env else None
 
 
-def make_token(password: str, *, now: float | None = None) -> str:
-    """ログイン保持用のトークン「期限.署名」。パスワードを変えると全員のトークンが無効になる。"""
-    exp = int((now if now is not None else time.time()) + AUTH_DAYS * 86400)
-    sig = hmac.new(_auth_key(password), str(exp).encode(), hashlib.sha256).hexdigest()
-    return f"{exp}.{sig}"
+def check_password(entered: str, cred: tuple[str, str]) -> bool:
+    kind, secret = cred
+    if kind == "db":
+        return db.verify_password(entered, secret)
+    return hmac.compare_digest(entered.encode(), secret.encode())
 
 
-def token_valid(token: str, password: str, *, now: float | None = None) -> bool:
-    try:
-        exp_s, sig = (token or "").split(".", 1)
-        exp = int(exp_s)
-    except ValueError:
-        return False
-    expected = hmac.new(_auth_key(password), exp_s.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig.encode(), expected.encode()) and exp > (now if now is not None else time.time())
+def make_token(cred: tuple[str, str]) -> str:
+    """ログイン保持用のトークン。パスワードを変えると、それまでのトークンは全部無効になる。"""
+    key = hashlib.sha256(f"ink-scheduler-auth:{cred[0]}:{cred[1]}".encode()).digest()
+    return hmac.new(key, b"session", hashlib.sha256).hexdigest()
+
+
+def token_valid(token: str, cred: tuple[str, str]) -> bool:
+    return isinstance(token, str) and bool(token) and hmac.compare_digest(token.encode(), make_token(cred).encode())
 
 
 def run_js(code: str) -> None:
@@ -71,19 +77,19 @@ def run_js(code: str) -> None:
     st.html(f"<script>{code}</script>", unsafe_allow_javascript=True)
 
 
+def set_login_cookie(token: str) -> None:
+    run_js(f"document.cookie='{AUTH_COOKIE}={token}; max-age={AUTH_MAX_AGE}; path=/; SameSite=Lax';")
+
+
 def require_login() -> None:
-    password = os.environ.get("INK_SCHEDULER_PASSWORD", "")
-    if not password:
+    cred = current_credential()
+    if cred is None:
         return
     if st.session_state.get("authed"):
-        token = st.session_state.pop("_set_cookie", None)
-        if token:  # ログイン直後の1回だけ、ブラウザに保持用の cookie を置く
-            run_js(f"document.cookie='{AUTH_COOKIE}={token}; max-age={AUTH_DAYS * 86400}; path=/; SameSite=Lax';")
         return
     # ログアウト直後は、古い cookie があっても自動ログインしない
     if not st.session_state.get("_logged_out"):
-        cookie = st.context.cookies.get(AUTH_COOKIE, "")
-        if cookie and token_valid(cookie, password):
+        if token_valid(st.context.cookies.get(AUTH_COOKIE, ""), cred):
             st.session_state["authed"] = True
             return
     st.title("Ink Scheduler")
@@ -94,10 +100,10 @@ def require_login() -> None:
         entered = st.text_input("パスワード", type="password", key="login_pw")
         submitted = st.form_submit_button("ログイン")
     if submitted:
-        if hmac.compare_digest(entered.encode(), password.encode()):
+        if check_password(entered, cred):
             st.session_state["authed"] = True
             st.session_state["_logged_out"] = False
-            st.session_state["_set_cookie"] = make_token(password)
+            st.session_state["_set_cookie"] = make_token(cred)
             st.rerun()
         else:
             st.error("パスワードが違います")
@@ -121,10 +127,10 @@ def flash(message: str, kind: str = "success") -> None:
     st.session_state["_flash"] = (kind, message)
 
 
-def show_flash() -> None:
+def show_flash(target=st) -> None:
     item = st.session_state.pop("_flash", None)
     if item:
-        getattr(st, item[0])(item[1])
+        getattr(target, item[0])(item[1])
 
 
 def done(conn, message: str) -> None:
@@ -623,11 +629,48 @@ def render_settings(conn) -> None:
         db.set_setting(conn, "review_webhook_url", "")
         done(conn, "確認用Webhookを消しました")
 
-    if os.environ.get("INK_SCHEDULER_PASSWORD"):
-        st.subheader("ログイン")
-        st.caption(f"このブラウザは、ログインしてから{AUTH_DAYS}日間、パスワードなしで開けます。")
-        if st.button("ログアウトする", key="logout_btn"):
-            logout()
+    render_password(conn)
+
+
+def render_password(conn) -> None:
+    st.subheader("管理画面のパスワード")
+    cred = current_credential()
+    if cred is None:
+        st.warning("パスワードが未設定です。この管理画面を開ける人は、誰でも予約や送信先を変えられます。")
+    else:
+        st.caption(
+            "ログインしたブラウザは、ログアウトするまでパスワードなしで開けます。"
+            "パスワードを変えると、他のブラウザはログアウトされます。"
+        )
+        if cred[0] == "env":
+            st.caption("いまのパスワードは .env の初期値です。ここで変えると、以降はここで決めたパスワードが使われます。")
+    n = nonce("pw")
+    current_pw = st.text_input("いまのパスワード", type="password", key=f"pw_current_{n}") if cred else ""
+    new_pw = st.text_input(
+        f"新しいパスワード（{db.PASSWORD_MIN_LEN}文字以上）", type="password", key=f"pw_new_{n}"
+    )
+    new_pw2 = st.text_input("新しいパスワード（もう一度）", type="password", key=f"pw_new2_{n}")
+    if st.button("変更する" if cred else "設定する", key="pw_save"):
+        if cred and not check_password(current_pw, cred):
+            st.error("いまのパスワードが違います")
+        elif new_pw != new_pw2:
+            st.error("新しいパスワードが2回で一致しません")
+        else:
+            try:
+                db.set_admin_password(conn, new_pw)
+            except ValueError as e:
+                conn.rollback()
+                st.error(str(e))
+            else:
+                conn.commit()
+                st.session_state["authed"] = True
+                st.session_state["_logged_out"] = False
+                st.session_state["_set_cookie"] = make_token(current_credential())  # このブラウザは入ったまま
+                bump("pw")  # 入力欄を空に戻す
+                flash("パスワードを変更しました" if cred else "パスワードを設定しました")
+                st.rerun()
+    if cred and st.button("ログアウトする", key="logout_btn"):
+        logout()
 
 
 # ----------------------------------------------------------------------
@@ -635,10 +678,13 @@ def render_settings(conn) -> None:
 # ----------------------------------------------------------------------
 
 def main() -> None:
-    require_login()
     init_once()
+    require_login()
     st.title("Ink Scheduler")
-    show_flash()
+    # 案内・メッセージは、出たり消えたりしても下のタブの位置がずれないよう、固定の入れ物の中に出す
+    # （ずれると、操作のたびにタブが「予約」へ戻ってしまう）
+    notices = st.container()
+    show_flash(notices)
 
     with db.connect() as conn:
         tz = db.get_tz(conn)
@@ -646,9 +692,9 @@ def main() -> None:
             r["missed_policy"] == "notify" for r in db.list_birthdays(conn)
         )
         if not db.list_destinations(conn):
-            st.info("まず「送信先」タブで、送信先（Discord の Webhook）を登録してください。予約と誕生日はそこから選びます。")
+            notices.info("まず「送信先」タブで、送信先（Discord の Webhook）を登録してください。予約と誕生日はそこから選びます。")
         if needs_review and not db.get_setting(conn, "review_webhook_url"):
-            st.warning(
+            notices.warning(
                 "取りこぼし時の動作が「確認通知」の項目がありますが、確認用Webhookが未設定です。"
                 "「設定」タブで登録してください（未設定のままだと通知されず、スキップされます）。"
             )
@@ -663,6 +709,12 @@ def main() -> None:
             render_logs(conn, tz)
         with tab_c:
             render_settings(conn)
+
+    # ログイン直後・パスワード変更直後の1回だけ、ブラウザにログイン保持用の cookie を置く
+    # （タブより後ろに出すので、出たり消えたりしてもタブの位置に影響しない）
+    token = st.session_state.pop("_set_cookie", None)
+    if token:
+        set_login_cookie(token)
 
 
 main()
