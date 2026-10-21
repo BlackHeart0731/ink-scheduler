@@ -25,7 +25,8 @@ from zoneinfo import ZoneInfo
 # 定数
 # ----------------------------------------------------------------------
 
-DEFAULT_DB_PATH = Path.home() / "ink-scheduler" / "data" / "scheduler.db"
+# db.py と同じフォルダの data/ に置く（どこに clone しても、Docker の /app/data でも同じ動き）
+DEFAULT_DB_PATH = Path(__file__).resolve().parent / "data" / "scheduler.db"
 
 KINDS = ("once", "daily", "weekly", "monthly", "yearly")
 MISSED_POLICIES = ("notify", "late_send", "skip")
