@@ -29,7 +29,7 @@ Discord に、決めた日時でメッセージを自動投稿するツールで
 ## 導入
 
 ```
-git clone https://github.com/BlackHeart0731/ink-scheduler.git ink-scheduler
+git clone https://github.com/InkInc-official/ink-scheduler.git ink-scheduler
 cd ink-scheduler
 cp .env.example .env
 ```
