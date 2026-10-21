@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS birthdays (
     missed_policy TEXT NOT NULL DEFAULT 'late_send'
                   CHECK (missed_policy IN ('notify','late_send','skip')),
     enabled       INTEGER NOT NULL DEFAULT 1,
-    last_sent_on  TEXT,                            -- 最後に送った日 YYYY-MM-DD（二重送信防止）
+    last_handled_on TEXT,                          -- 最後に処理した日 YYYY-MM-DD（送信・通知・スキップのどれでも。二重処理防止）
     created_at    TEXT NOT NULL
 );
 
@@ -551,8 +551,9 @@ def birthdays_on(conn: sqlite3.Connection, d: date) -> list[sqlite3.Row]:
     return rows
 
 
-def mark_birthday_sent(conn: sqlite3.Connection, birthday_id: int, d: date) -> None:
-    conn.execute("UPDATE birthdays SET last_sent_on = ? WHERE id = ?", (d.isoformat(), birthday_id))
+def mark_birthday_handled(conn: sqlite3.Connection, birthday_id: int, d: date) -> None:
+    """その日の誕生日を処理済みにする（送った・通知した・スキップした、のどれでも）。"""
+    conn.execute("UPDATE birthdays SET last_handled_on = ? WHERE id = ?", (d.isoformat(), birthday_id))
 
 
 def render_birthday_message(row: sqlite3.Row) -> str:
